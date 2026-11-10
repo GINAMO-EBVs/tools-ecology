@@ -10,7 +10,9 @@
         <requirement type="package" version="1.8.2">r-optparse</requirement>
         <requirement type="package" version="1.2.1">r-dplyr</requirement>
     </requirements>
-
+<required_files> 
+         <include  path="eionet_fetch.R"/>
+</required_files>
     <command detect_errors="exit_code"><![CDATA[
         mkdir -p output_files &&
 
