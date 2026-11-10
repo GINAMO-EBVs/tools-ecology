@@ -1,5 +1,12 @@
 # Fetch species data from the EIONET Article 12 (birds) and Article 17 (other
 # groups) web tools by querying the public pages and parsing the HTML tables.
+#
+# Two input modes:
+#   - manual : one taxon, one or several species, one or several periods
+#   - table  : an input table (columns Taxon, Period, Species, Country)
+#              describing one query per row; several taxa can be mixed
+# The EIONET article is derived from the taxon: Birds -> Article 12,
+# every other taxonomic group -> Article 17.
 
 # Note: parts of this code were written with the assistance of an AI model (Claude, developed by Anthropic).
 
@@ -18,16 +25,22 @@ suppressPackageStartupMessages({
 `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && !is.na(a[1])) a else b
 
 option_list <- list(
-  make_option("--source",        type="character", default="art12",
-              help="Which EIONET reporting tool to query: 'art12' (birds) or 'art17' (other species groups)."),
-  make_option("--subject",       type="character"),
-  make_option("--group",         type="character", default=NULL,
-              help="Taxonomic group (Article 17 only). Ignored for --source art12."),
-  make_option("--period",        type="character"),
+  make_option("--mode",          type="character", default="manual",
+              help="Input mode: 'manual' (form values) or 'table' (queries read from --table)."),
+  make_option("--taxon",         type="character", default=NULL,
+              help="Manual mode: taxon (Birds, Mammals, Reptiles, ...). Birds use Article 12, other groups Article 17."),
+  make_option("--include_eu",    action="store_true", default=FALSE,
+              help="Table mode only: also retrieve the EU-level assessment for every query."),
+  make_option("--table",         type="character", default=NULL,
+              help="Table mode only: path to the query table (Taxon, Period, Species, Country)."),
+  make_option("--subject",       type="character",
+              help="Species latin name(s), comma-separated (manual mode)."),
+  make_option("--period",        type="character",
+              help="Reporting period(s), comma-separated (manual mode)."),
   make_option("--country",       type="character", default=NULL,
               help="Filter by Member State code(s), comma-separated. 'EU' selects the EU-level assessment table (Article 17: not available for 2019-2024)."),
   make_option("--region",        type="character", default=NULL,
-              help="Article 17 only: filter by bio-geographical region code (ALP, ATL, BLS, BOR, CON, MED, PAN). Empty = all regions.")
+              help="Article 17 taxa only: filter by bio-geographical region code (ALP, ATL, BLS, BOR, CON, MED, PAN). Empty = all regions.")
 )
 
 opt <- parse_args(OptionParser(option_list=option_list))
@@ -104,7 +117,7 @@ run_art12 <- function(opt) {
   # State (MS) rows, followed (when available) by the EU assessment rows.
 
   table_node <- html_node(html, "table.complex_datatable") #search the first element (main table)
-  if (is.na(table_node)) stop("Tableau introuvable. Vérifiez le nom de l'espèce.")
+  if (is.na(table_node)) stop("Table not found. Check the species name.")
   ##if table doesn't find, species name incorrect or empty page
 
   normalize_row <- function(row_vals, n_cols) {
@@ -396,22 +409,13 @@ run_art12 <- function(opt) {
 
   message("Final MS lines : ", nrow(df_ms))
 
-    # Write the output files (header-only when there is nothing to report)
-  if (show_ms && nrow(df_ms) > 0) {
-    write.table(df_ms, file="output_files/MS_data.txt", row.names=FALSE, col.names=TRUE, sep="\t", quote=FALSE)
-    message("MS file written : output_files/MS_data.txt")
-  } else {
-    write.table(df_ms[0,], file="output_files/MS_data.txt", row.names=FALSE, col.names=TRUE, sep="\t", quote=FALSE)
+  # Return the tables (header-only when there is nothing to report);
+  # the caller aggregates the results of all queries and writes the files.
+  if (!(show_eu && !is.null(df_eu) && nrow(df_eu) > 0)) {
+    df_eu <- data.frame(matrix(ncol=length(eu_col_names)+1, nrow=0))
+    colnames(df_eu) <- c("Species", eu_col_names)
   }
- 
-  if (show_eu && !is.null(df_eu) && nrow(df_eu) > 0) {
-    write.table(df_eu, file="output_files/EU_data.txt", row.names=FALSE, col.names=TRUE, sep="\t", quote=FALSE)
-    message("EU file written : output_files/EU_data.txt")
-  } else {
-    empty_eu <- data.frame(matrix(ncol=length(eu_col_names)+1, nrow=0))
-    colnames(empty_eu) <- c("Species", eu_col_names)
-    write.table(empty_eu, file="output_files/EU_data.txt", row.names=FALSE, col.names=TRUE, sep="\t", quote=FALSE)
-  }
+  list(ms = if (show_ms) df_ms else df_ms[0, , drop=FALSE], eu = df_eu)
 }
 
 # ============================================================
@@ -724,22 +728,378 @@ run_art17 <- function(opt) {
  
   message("Final MS rows : ", nrow(df), " | EU rows : ", nrow(df_eu))
  
-  write.table(if (show_ms) df else df[0, ], file = "output_files/ART17_data.txt",
-              row.names = FALSE, col.names = TRUE, sep = "\t", quote = FALSE)
-  message("Article 17 MS file written : output_files/ART17_data.txt")
- 
-  write.table(if (show_eu) df_eu else df_eu[0, ], file = "output_files/ART17_EU_data.txt",
-              row.names = FALSE, col.names = TRUE, sep = "\t", quote = FALSE)
-  message("Article 17 EU file written : output_files/ART17_EU_data.txt")
+  # Return the tables; the caller aggregates the results of all queries and writes the files.
+  list(ms = if (show_ms) df else df[0, , drop = FALSE],
+       eu = if (show_eu) df_eu else df_eu[0, , drop = FALSE])
 }
  
+# ============================================================
+# QUERY BUILDING (manual form or input table)
+# ============================================================
+OUT_DIR <- "output_files"
+
+# Lower-case a string and drop everything but letters and digits (used to match
+# column names and category labels leniently)
+norm_key <- function(x) tolower(gsub("[^A-Za-z0-9]", "", x))
+
+# Trim values, strip surrounding quotes, turn empty strings into NA
+clean_cells <- function(x) {
+  x <- trimws(gsub('^"|"$', "", x))
+  x[!is.na(x) & !nzchar(x)] <- NA_character_
+  x
+}
+
+# Split a delimited string into trimmed, unique, non-empty values.
+# "None" is what Galaxy writes for an unselected optional parameter.
+split_values <- function(x, pattern = "[,;]+") {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(character(0))
+  vals <- trimws(unlist(strsplit(as.character(x), pattern)))
+  unique(vals[nchar(vals) > 0 & vals != "None"])
+}
+
+# Birds are reported under Article 12; every other group under Article 17
+BIRD_ALIASES <- c("birds", "bird", "aves")
+
+GROUP_ALIASES <- list(
+  "Amphibians"          = c("amphibians", "amphibian"),
+  "Arthropods"          = c("arthropods", "arthropod"),
+  "Fish"                = c("fish", "fishes"),
+  "Mammals"             = c("mammals", "mammal"),
+  "Molluscs"            = c("molluscs", "mollusc", "mollusks", "mollusk"),
+  "Non-vascular plants" = c("nonvascularplants", "nonvascularplant"),
+  "Other invertebrates" = c("otherinvertebrates"),
+  "Reptiles"            = c("reptiles", "reptile"),
+  "Vascular plants"     = c("vascularplants", "vascularplant")
+)
+
+# Return the canonical name whose alias list contains x (NA when unknown)
+lookup_alias <- function(x, alias_list) {
+  key <- norm_key(x)
+  if (is.na(key)) return(NA_character_)
+  for (nm in names(alias_list)) {
+    if (key %in% alias_list[[nm]]) return(nm)
+  }
+  NA_character_
+}
+
+# Derive the EIONET article from a taxon label.
+# Returns list(article, group) or NULL when the taxon is not recognised.
+resolve_taxon <- function(x) {
+  key <- norm_key(x)
+  if (is.na(key)) return(NULL)
+  if (key %in% BIRD_ALIASES) return(list(article = "art12", group = ""))
+  grp <- lookup_alias(x, GROUP_ALIASES)
+  if (!is.na(grp)) return(list(article = "art17", group = grp))
+  NULL
+}
+
+ACCEPTED_TAXA <- paste(c("Birds", names(GROUP_ALIASES)), collapse = ", ")
+
+# Merge the country cells of several table rows into one country filter string.
+# Empty cell / "all" -> every Member State; "EU" is kept next to it when requested.
+merge_countries <- function(cells) {
+  has_blank <- any(is.na(cells))
+  tokens    <- toupper(split_values(cells, "[,;|[:space:]]+"))
+  has_all   <- has_blank || any(tokens %in% c("ALL", "ALL_COUNTRIES"))
+  tokens    <- setdiff(tokens, c("ALL", "ALL_COUNTRIES"))
+  if (has_all || length(tokens) == 0) {
+    return(paste(c("all_countries", intersect(tokens, "EU")), collapse = ","))
+  }
+  paste(tokens, collapse = ",")
+}
+
+# ---- Manual mode: species x periods for the chosen article ----
+build_manual_queries <- function(opt) {
+  taxon <- resolve_taxon(opt$taxon)
+  if (is.null(taxon)) {
+    stop("Unrecognised --taxon: '", opt$taxon %||% "", "'. Accepted: ", ACCEPTED_TAXA, ".")
+  }
+  article <- taxon$article
+  message("Taxon '", opt$taxon, "' -> ", article)
+  species <- split_values(opt$subject)
+  periods <- split_values(opt$period)
+  if (length(species) == 0) stop("No species name provided (--subject).")
+  if (length(periods) == 0) stop("No reporting period provided (--period).")
+
+  q <- expand.grid(period = periods, species = species, stringsAsFactors = FALSE)
+  q$article <- article
+  q$group   <- taxon$group
+  q$country <- paste(split_values(opt$country), collapse = ",")
+  q$region  <- if (article == "art17") paste(split_values(opt$region), collapse = ",") else ""
+  message("Manual mode: ", length(species), " species x ", length(periods), " period(s) = ", nrow(q), " query(ies)")
+  list(queries = q[, c("article", "group", "period", "species", "country", "region")],
+       skipped = NULL)
+}
+
+# ---- Table mode ----
+# Read a tab-, comma- or semicolon-separated table (delimiter sniffed from the header)
+read_query_table <- function(path) {
+  if (is.null(path) || !nzchar(path) || !file.exists(path)) {
+    stop("Query table not found: '", path %||% "", "'.")
+  }
+  header <- readLines(path, n = 1, warn = FALSE)
+  if (length(header) == 0 || !nzchar(header)) stop("The query table is empty.")
+  seps   <- c("\t", ",", ";")
+  counts <- vapply(seps, function(s) nchar(header) - nchar(gsub(s, "", header, fixed = TRUE)), numeric(1))
+  sep    <- if (max(counts) == 0) "\t" else seps[which.max(counts)]
+  message("Query table delimiter detected: ", if (sep == "\t") "tab" else sep)
+
+  tbl <- read.table(path, header = TRUE, sep = sep, quote = "", comment.char = "",
+                    check.names = FALSE, colClasses = "character", strip.white = TRUE,
+                    fill = TRUE, na.strings = c("NA", ""), fileEncoding = "UTF-8-BOM",
+                    stringsAsFactors = FALSE)
+  if (nrow(tbl) == 0) stop("The query table has a header but no data rows.")
+  tbl
+}
+
+# Index of the first column whose normalised name is in `aliases` (NA when absent)
+find_column <- function(tbl, aliases, label, required = TRUE) {
+  hit <- which(norm_key(colnames(tbl)) %in% aliases)
+  if (length(hit) == 0) {
+    if (required) {
+      stop("Column '", label, "' not found in the query table. Columns found: ",
+           paste(colnames(tbl), collapse = ", "))
+    }
+    return(NA_integer_)
+  }
+  hit[1]
+}
+
+build_table_queries <- function(path) {
+  tbl   <- read_query_table(path)
+  i_tax <- find_column(tbl, c("taxon", "taxa", "taxonomicgroup", "group"), "Taxon")
+  i_per <- find_column(tbl, c("period", "reportingperiod"), "Period")
+  i_spe <- find_column(tbl, c("species", "subject", "speciesname", "latinname"), "Species")
+  i_cty <- find_column(tbl, c("country", "countries", "ms", "memberstate"), "Country", required = FALSE)
+  if (is.na(i_cty)) message("WARNING : no Country column found; all countries will be requested.")
+  message("Query table: ", nrow(tbl), " row(s); other columns are ignored")
+
+  col_or_na <- function(i) if (is.na(i)) rep(NA_character_, nrow(tbl)) else clean_cells(tbl[[i]])
+  raw <- data.frame(
+    row_id      = seq_len(nrow(tbl)),
+    taxon_raw   = col_or_na(i_tax),
+    period      = gsub("[\u2010-\u2015]", "-", col_or_na(i_per)),
+    species     = col_or_na(i_spe),
+    country     = col_or_na(i_cty),
+    stringsAsFactors = FALSE
+  )
+  # The article (and Article 17 group) is derived from the taxon
+  resolved    <- lapply(raw$taxon_raw, resolve_taxon)
+  raw$article <- vapply(resolved, function(r) if (is.null(r)) NA_character_ else r$article, character(1))
+  raw$group   <- vapply(resolved, function(r) if (is.null(r)) NA_character_ else r$group,   character(1))
+
+  # Row-level validation: invalid rows are reported in the log and skipped
+  reason <- rep(NA_character_, nrow(raw))
+  reason[is.na(raw$article)] <- paste0("Unrecognised Taxon (accepted: ", ACCEPTED_TAXA, ")")
+  reason[is.na(raw$taxon_raw)] <- "Missing Taxon"
+  reason[is.na(raw$period)]  <- "Missing Period"
+  reason[is.na(raw$species)] <- "Missing Species"
+  bad <- !is.na(reason)
+
+  skipped <- NULL
+  if (any(bad)) {
+    skipped <- data.frame(
+      article = ifelse(is.na(raw$article[bad]), "", raw$article[bad]),
+      group   = ifelse(is.na(raw$taxon_raw[bad]), "", raw$taxon_raw[bad]),
+      period  = ifelse(is.na(raw$period[bad]),  "", raw$period[bad]),
+      species = ifelse(is.na(raw$species[bad]), "", raw$species[bad]),
+      country = ifelse(is.na(raw$country[bad]), "", raw$country[bad]), region = "",
+      message = paste0("Table row ", raw$row_id[bad] + 1, ": ", reason[bad]),
+      stringsAsFactors = FALSE
+    )
+    message("WARNING : ", sum(bad), " row(s) skipped (see the query log)")
+  }
+  raw <- raw[!bad, , drop = FALSE]
+  if (nrow(raw) == 0) return(list(queries = raw[0, c("article", "group", "period", "species", "country")], skipped = skipped))
+
+  # One query per unique (article, group, period, species); countries of the
+  # matching rows are merged so that each page is fetched only once
+  key <- paste(raw$article, raw$group, raw$period, raw$species, sep = "\r")
+  keep_order <- unique(key)
+  queries <- do.call(rbind, lapply(keep_order, function(k) {
+    sub <- raw[key == k, , drop = FALSE]
+    data.frame(article = sub$article[1], group = sub$group[1], period = sub$period[1],
+               species = sub$species[1], country = merge_countries(sub$country),
+               region = "", stringsAsFactors = FALSE)
+  }))
+  message("Table mode: ", nrow(raw), " valid row(s) -> ", nrow(queries), " unique query(ies)")
+  list(queries = queries, skipped = skipped)
+}
+
+# ============================================================
+# RUNNING THE QUERIES
+# ============================================================
+
+# Give a name to every unnamed column. The pre-2019 Article 12 layout has more
+# cells per row than column names, which leaves trailing columns named NA.
+fix_column_names <- function(df) {
+  nm  <- colnames(df)
+  bad <- is.na(nm) | !nzchar(nm)
+  if (any(bad)) {
+    nm[bad] <- paste0("Unnamed_", which(bad))
+    colnames(df) <- nm
+    message("WARNING : ", sum(bad), " unnamed column(s) renamed to ", paste(nm[bad], collapse = ", "))
+  }
+  df
+}
+
+# Insert a Period column right after Species (Article 12 tables do not carry one).
+# Columns are moved by position, never by name.
+insert_period <- function(df, period) {
+  if ("Period" %in% colnames(df)) return(df)
+  df$Period <- rep(period, nrow(df))
+  n  <- ncol(df)
+  sp <- match("Species", colnames(df))
+  if (is.na(sp)) return(df)
+  df[, c(seq_len(sp), n, setdiff(seq_len(n - 1), seq_len(sp))), drop = FALSE]
+}
+
+# Table mode: the EU-level assessment is requested for all queries or for none.
+# "EU" tokens of the Country column are replaced by the include_eu setting.
+apply_eu_flag <- function(country, include_eu) {
+  vapply(country, function(cty) {
+    tokens <- split_values(cty, "[,;|[:space:]]+")
+    has_eu <- any(toupper(tokens) == "EU")
+    non_eu <- tokens[toupper(tokens) != "EU"]
+    if (length(non_eu) == 0) {
+      if (has_eu && include_eu) return("EU")
+      if (has_eu) message("WARNING : a row requests only 'EU' but the EU assessment is not enabled; all countries requested instead")
+      non_eu <- "all_countries"
+    }
+    paste(c(non_eu, if (include_eu) "EU"), collapse = ",")
+  }, character(1), USE.NAMES = FALSE)
+}
+
+# Fetch one query (one row of the query data frame) and return list(ms, eu)
+run_query <- function(q) {
+  q_opt <- list(
+    source  = q$article,
+    subject = q$species,
+    group   = if (nzchar(q$group))   q$group   else NULL,
+    period  = q$period,
+    country = if (nzchar(q$country)) q$country else NULL,
+    region  = if (nzchar(q$region))  q$region  else NULL
+  )
+  res <- if (q$article == "art12") run_art12(q_opt) else run_art17(q_opt)
+  res$ms <- fix_column_names(res$ms)
+  res$eu <- fix_column_names(res$eu)
+  if (q$article == "art12") {
+    res$ms <- insert_period(res$ms, q$period)
+    res$eu <- insert_period(res$eu, q$period)
+  }
+  res
+}
+
+# One-row data frame describing the outcome of a query (for the log file)
+make_log_row <- function(id, q, status, n_ms = 0, n_eu = 0, msg = "") {
+  data.frame(
+    Query = id, Article = q$article, Group = q$group, Period = q$period,
+    Species = q$species, Country = q$country, Status = status,
+    MS_rows = n_ms, EU_rows = n_eu,
+    Message = gsub("[\t\r\n]+", " ", msg),
+    stringsAsFactors = FALSE
+  )
+}
+
+# Row-bind a list of tables; a header-only table is returned when all are empty
+bind_or_empty <- function(tables, default_cols) {
+  non_empty <- Filter(function(d) !is.null(d) && nrow(d) > 0, tables)
+  if (length(non_empty) > 0) return(dplyr::bind_rows(non_empty))
+  cols <- if (length(tables) > 0 && !is.null(tables[[1]])) colnames(tables[[1]]) else default_cols
+  as.data.frame(setNames(replicate(length(cols), character(0), simplify = FALSE), cols),
+                stringsAsFactors = FALSE)
+}
+
+write_tsv <- function(df, file) {
+  write.table(df, file = file.path(OUT_DIR, file), row.names = FALSE, col.names = TRUE,
+              sep = "\t", quote = FALSE)
+  message("File written : ", file.path(OUT_DIR, file), " (", nrow(df), " row(s))")
+}
+
 # ============================================================
 # Main
 # ============================================================
-if (opt$source == "art12") {
-  run_art12(opt)
-} else if (opt$source == "art17") {
-  run_art17(opt)
-} else {
-  stop("Unknown --source: '", opt$source, "'. Expected 'art12' or 'art17'.")
+main <- function(opt) {
+  dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+  mode <- tolower(trimws(opt$mode %||% "manual"))
+  built <- if (mode == "table") {
+    build_table_queries(opt$table)
+  } else if (mode == "manual") {
+    build_manual_queries(opt)
+  } else {
+    stop("Unknown --mode: '", mode, "'. Expected 'manual' or 'table'.")
+  }
+  queries <- built$queries
+  skipped <- built$skipped
+  if (mode == "table" && nrow(queries) > 0) {
+    queries$country <- apply_eu_flag(queries$country, isTRUE(opt$include_eu))
+  }
+
+  store    <- list(art12_ms = list(), art12_eu = list(), art17_ms = list(), art17_eu = list())
+  log_rows <- list()
+  n_total  <- nrow(queries) + if (is.null(skipped)) 0 else nrow(skipped)
+
+  for (i in seq_len(nrow(queries))) {
+    q <- queries[i, , drop = FALSE]
+    message("---- Query ", i, "/", nrow(queries), " : ", q$article, " | ", q$species,
+            " | ", q$period, if (nzchar(q$group)) paste0(" | ", q$group) else "")
+
+    # A failing query (misspelled species, no data, network error...) must not
+    # stop the others: the error is caught and written to the log
+    outcome <- tryCatch(
+      list(ok = TRUE, res = run_query(q)),
+      error = function(e) list(ok = FALSE, msg = conditionMessage(e))
+    )
+
+    if (outcome$ok) {
+      n_ms <- nrow(outcome$res$ms)
+      n_eu <- nrow(outcome$res$eu)
+      store[[paste0(q$article, "_ms")]][[length(store[[paste0(q$article, "_ms")]]) + 1]] <- outcome$res$ms
+      store[[paste0(q$article, "_eu")]][[length(store[[paste0(q$article, "_eu")]]) + 1]] <- outcome$res$eu
+      status <- if (n_ms + n_eu == 0) "NO_DATA" else "OK"
+      log_rows[[length(log_rows) + 1]] <- make_log_row(i, q, status, n_ms, n_eu)
+    } else {
+      message("FAILED : ", outcome$msg)
+      log_rows[[length(log_rows) + 1]] <- make_log_row(i, q, "FAILED", msg = outcome$msg)
+    }
+
+    if (i < nrow(queries)) Sys.sleep(1)  # be gentle with the EIONET servers
+  }
+
+  # Rows skipped during table validation
+  if (!is.null(skipped)) {
+    for (j in seq_len(nrow(skipped))) {
+      sk <- skipped[j, , drop = FALSE]
+      log_rows[[length(log_rows) + 1]] <- make_log_row(NA, sk, "SKIPPED", msg = sk$message)
+    }
+  }
+
+  log_df <- dplyr::bind_rows(log_rows)
+
+  # All output files are always written (header-only when empty) so that Galaxy finds them
+  write_tsv(bind_or_empty(store$art12_ms, c("Species", "Period", "MS")),             "MS_data.txt")
+  write_tsv(bind_or_empty(store$art12_eu, c("Species", "Period", "EU")),             "EU_data.txt")
+  write_tsv(bind_or_empty(store$art17_ms, c("Species", "Group", "Period", "MS")),    "ART17_data.txt")
+  write_tsv(bind_or_empty(store$art17_eu, c("Species", "Group", "Period", "EU")),    "ART17_EU_data.txt")
+  write_tsv(log_df, "QUERY_LOG.txt")
+
+  n_ok <- sum(log_df$Status %in% c("OK", "NO_DATA"))
+  message("Summary : ", n_total, " query(ies) -> ", sum(log_df$Status == "OK"), " OK, ",
+          sum(log_df$Status == "NO_DATA"), " without data, ",
+          sum(log_df$Status == "FAILED"), " failed, ", sum(log_df$Status == "SKIPPED"), " skipped")
+
+  # Repeat the reasons of every failed or skipped query in the console
+  problems <- log_df[log_df$Status %in% c("FAILED", "SKIPPED"), , drop = FALSE]
+  for (k in seq_len(nrow(problems))) {
+    message(problems$Status[k], " : ", problems$Species[k], " | ", problems$Period[k], " | ", problems$Message[k])
+  }
+
+  if (n_ok == 0) {
+    first_msg <- log_df$Message[log_df$Message != ""][1]
+    stop("No query succeeded. ", if (!is.na(first_msg)) first_msg else "")
+  }
 }
+
+main(opt)
